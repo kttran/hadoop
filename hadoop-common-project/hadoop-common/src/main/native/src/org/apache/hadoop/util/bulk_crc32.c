@@ -33,12 +33,17 @@
 #include <unistd.h>
 #endif // UNIX
 
+#ifdef __aarch64__
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
 #include "crc32_zlib_polynomial_tables.h"
 #include "crc32c_tables.h"
 #include "bulk_crc32.h"
 #include "gcc_optimizations.h"
 
-#if (!defined(__FreeBSD__) && !defined(WINDOWS))
+#if (!defined(__FreeBSD__) && !defined(WINDOWS)) && !defined(__aarch64__)
 #define USE_PIPELINED
 #endif
 
@@ -52,7 +57,7 @@ static uint32_t crc32c_sb8(uint32_t crc, const uint8_t *buf, size_t length);
 #ifdef USE_PIPELINED
 static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, const uint8_t *p_buf, size_t block_size, int num_blocks);
 #endif
-static int cached_cpu_supports_crc32; // initialized by constructor below
+static int cached_cpu_supports_crc32 = 0; // initialized by constructor below
 static uint32_t crc32c_hardware(uint32_t crc, const uint8_t* data, size_t length);
 
 static inline int store_or_verify(uint32_t *sums, uint32_t crc,
@@ -91,7 +96,12 @@ int bulk_crc(const uint8_t *data, size_t data_len,
         do_pipelined = 1;
 #endif
       } else {
+#ifdef __aarch64__
+        crc_update_func = crc32c_hardware;
+	cached_cpu_supports_crc32 = 1;
+#else
         crc_update_func = crc32c_sb8;
+#endif
       }
       break;
     default:
@@ -279,12 +289,17 @@ static uint32_t cpuid(uint32_t eax_in) {
 }
 
 /**
- * On library load, initiailize the cached value above for
- * whether the cpu supports SSE4.2's crc32 instruction.
+ * On library load, initialize the cached value above for
+ * whether the cpu supports ARM64 SSE4.2's crc32 instruction.
  */
 void __attribute__ ((constructor)) init_cpu_support_flag(void) {
+#ifdef __aarch64__
+  uint64_t hwcaps = getauxval(AT_HWCAP);
+  cached_cpu_supports_crc32 = hwcaps & HWCAP_CRC32;
+#else
   uint32_t ecx = cpuid(CPUID_FEATURES);
   cached_cpu_supports_crc32 = ecx & SSE42_FEATURE_BIT;
+#endif // __aarch64__
 }
 
 
@@ -654,7 +669,43 @@ static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, con
 
 # endif // 64-bit vs 32-bit
 
-#else // end x86 architecture
+//#else // end x86 architecture
+#elif defined(__aarch64__)
+
+// #define CRC32X(crc,v) asm("crc32cx %w[c], %w[c], %x[v]" : [c]"+r"(crc) : [v]"r"(v))
+// #define CRC32B(crc,v) asm("crc32cb %w[c], %w[c], %w[v]" : [c]"+r"(crc) : [v]"r"(v))
+
+#define CRC32X(crc, value) __asm__("crc32x %w[c], %w[c], %x[v]":[c]"+r"(crc):[v]"r"(value))
+#define CRC32B(crc, value) __asm__("crc32b %w[c], %w[c], %w[v]":[c]"+r"(crc):[v]"r"(value))
+
+static uint32_t crc32c_hardware(uint32_t crc, const uint8_t *pbuf, size_t length)
+{
+    int len = length;
+    uint64_t x1;
+
+    if(len > 128)__builtin_prefetch(pbuf + 128);
+    asm(".cpu generic+crc");
+    while ((((int)pbuf) & 0xf) && len) {
+	x1 = *pbuf++;
+	CRC32B(crc, x1);
+	len--;
+    }
+
+    while(len >= 8) {
+	if (!(((int)pbuf) & 0x3f)) __builtin_prefetch(pbuf + 256);
+	x1 = *((uint64_t*)pbuf);
+	CRC32X(crc, x1);
+	pbuf += 8;
+	len -= 8;
+    }
+
+    while (len--) {
+	CRC32B(crc, *(pbuf++));
+    }
+    return crc;
+}
+
+#else
 
 static uint32_t crc32c_hardware(uint32_t crc, const uint8_t* data, size_t length) {
   // never called!
